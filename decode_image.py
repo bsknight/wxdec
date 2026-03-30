@@ -299,17 +299,21 @@ def extract_md5_from_packed_info(blob):
 class ImageResolver:
     """封装从 local_id 到图片文件的完整解析链"""
 
-    def __init__(self, wechat_base_dir, decoded_image_dir, cache):
+    def __init__(self, wechat_base_dir, decoded_image_dir, cache, image_aes_key=None, image_xor_key=0x88):
         """
         Args:
             wechat_base_dir: 微信数据根目录 (如 D:\\xwechat_files\\<wxid>)
             decoded_image_dir: 解密图片输出目录
             cache: DBCache 实例，用于解密 message_resource.db
+            image_aes_key: V2 格式图片的 AES key
+            image_xor_key: V2 格式图片的 XOR key
         """
         self.base_dir = wechat_base_dir
         self.attach_dir = os.path.join(wechat_base_dir, "msg", "attach")
         self.out_dir = decoded_image_dir
         self.cache = cache
+        self.image_aes_key = image_aes_key
+        self.image_xor_key = image_xor_key
 
     def get_image_md5(self, local_id):
         """通过 local_id 查 message_resource.db 获取图片文件 MD5"""
@@ -320,7 +324,7 @@ class ImageResolver:
         conn = sqlite3.connect(path)
         try:
             row = conn.execute(
-                "SELECT packed_info FROM MessageResourceInfo WHERE local_id = ?",
+                "SELECT packed_info FROM MessageResourceInfo WHERE message_local_id = ?",
                 (local_id,)
             ).fetchone()
             if row and row[0]:
@@ -351,11 +355,14 @@ class ImageResolver:
 
         return sorted(results)
 
-    def decode_image(self, username, local_id):
+    def decode_image(self, username, local_id, quality="hd"):
         """完整流程：local_id → MD5 → .dat → 解密
 
+        Args:
+            quality: "hd" 优先高清(默认), "thumb" 优先缩略图
+
         Returns:
-            dict with keys: success, path, format, md5, error
+            dict with keys: success, path, format, md5, quality, error
         """
         # 1. 获取 MD5
         file_md5 = self.get_image_md5(local_id)
@@ -367,31 +374,43 @@ class ImageResolver:
         if not dat_files:
             return {'success': False, 'error': f'找不到 .dat 文件 (MD5={file_md5})', 'md5': file_md5}
 
-        # 优先选标准版（非 _t/_h），然后高清 _h，最后缩略图 _t
-        selected = dat_files[0]
-        for f in dat_files:
-            fname = os.path.basename(f)
-            if not fname.startswith(file_md5 + '_'):
-                selected = f
-                break
+        # 按类型分组
+        f_std, f_hd, f_thumb = None, None, None
         for f in dat_files:
             if f.endswith('_h.dat'):
-                selected = f
-                break
+                f_hd = f
+            elif f.endswith('_t.dat'):
+                f_thumb = f
+            else:
+                f_std = f
+
+        # 根据 quality 选择，fallback 到其他版本
+        if quality == "thumb":
+            selected = f_thumb or f_std or f_hd
+        else:
+            selected = f_hd or f_std or f_thumb
 
         # 3. 解密
         out_name = f"{file_md5}"
         out_path_base = os.path.join(self.out_dir, out_name)
 
-        result_path, fmt = xor_decrypt_file(selected, f"{out_path_base}.tmp")
+        result_path, fmt = decrypt_dat_file(selected, f"{out_path_base}.tmp", aes_key=self.image_aes_key, xor_key=self.image_xor_key)
         if not result_path:
-            return {'success': False, 'error': f'无法检测 XOR key (文件: {selected})', 'md5': file_md5}
+            return {'success': False, 'error': f'无法解密 (文件: {selected})', 'md5': file_md5}
 
         # 重命名为正确扩展名
         final_path = f"{out_path_base}.{fmt}"
         if os.path.exists(final_path):
             os.unlink(final_path)
         os.rename(result_path, final_path)
+
+        # 判断实际使用的版本
+        if selected == f_hd:
+            actual_quality = "hd"
+        elif selected == f_thumb:
+            actual_quality = "thumb"
+        else:
+            actual_quality = "standard"
 
         return {
             'success': True,
@@ -400,6 +419,8 @@ class ImageResolver:
             'md5': file_md5,
             'source': selected,
             'size': os.path.getsize(final_path),
+            'quality': actual_quality,
+            'available': [q for q, f in [("hd", f_hd), ("standard", f_std), ("thumb", f_thumb)] if f],
         }
 
     def list_chat_images(self, db_path, table_name, username, limit=20):

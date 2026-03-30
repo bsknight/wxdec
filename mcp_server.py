@@ -12,6 +12,7 @@ from datetime import datetime
 import xml.etree.ElementTree as ET
 from Crypto.Cipher import AES
 from mcp.server.fastmcp import FastMCP
+from mcp.types import TextContent, ImageContent
 import zstandard as zstd
 from decode_image import ImageResolver
 from key_utils import get_key_info, key_path_variants, strip_key_metadata
@@ -498,13 +499,84 @@ def _format_app_message_text(content, local_type, is_group, chat_username, chat_
         return quote_text
 
     if app_type == 6:
-        return f"[文件] {title}" if title else "[文件]"
+        attach = appmsg.find('.//appattach')
+        ext = ''
+        size = 0
+        if attach is not None:
+            ext = (attach.findtext('fileext') or '').strip()
+            size = _parse_int(attach.findtext('totallen'))
+        parts = [f"[文件] {title}" if title else "[文件]"]
+        if ext:
+            parts.append(f"类型: {ext}")
+        if size:
+            if size >= 1048576:
+                parts.append(f"大小: {size / 1048576:.1f}MB")
+            else:
+                parts.append(f"大小: {size / 1024:.0f}KB")
+        return "  ".join(parts)
+
     if app_type == 5:
-        return f"[链接] {title}" if title else "[链接]"
-    if app_type in (33, 36, 44):
-        return f"[小程序] {title}" if title else "[小程序]"
+        url = (appmsg.findtext('url') or '').strip().replace('&amp;', '&')
+        des = _collapse_text(appmsg.findtext('des') or '')
+        source = (appmsg.findtext('sourcedisplayname') or '').strip()
+        parts = [f"[链接] {title}" if title else "[链接]"]
+        if source:
+            parts.append(f"来源: {source}")
+        if url:
+            # 清理微信公众号 tracking 参数
+            if 'mp.weixin.qq.com' in url:
+                from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+                pu = urlparse(url)
+                params = parse_qs(pu.query, keep_blank_values=False)
+                keep = {k: v for k, v in params.items()
+                        if k in ('__biz', 'mid', 'idx', 'sn', 'chksm')}
+                url = urlunparse(pu._replace(query=urlencode(keep, doseq=True), fragment=''))
+            parts.append(f"URL: {url}")
+        if des:
+            if len(des) > 200:
+                des = des[:200] + "..."
+            parts.append(f"摘要: {des}")
+        return "\n".join(parts)
+
+    if app_type in (33, 36):
+        source = (appmsg.findtext('sourcedisplayname') or '').strip()
+        parts = [f"[小程序] {title}" if title else "[小程序]"]
+        if source:
+            parts.append(f"来源: {source}")
+        return "  ".join(parts)
+
+    if app_type == 51:
+        return f"[视频号] {title}" if title else "[视频号]"
+
+    if app_type == 19:
+        items = []
+        ri = appmsg.findtext('recorditem') or ''
+        if ri:
+            ri_root = _parse_xml_root(ri)
+            if ri_root is not None:
+                for di in ri_root.findall('.//dataitem'):
+                    name = (di.findtext('sourcename') or '').strip()
+                    desc = (di.findtext('datadesc') or '').strip()
+                    if name and desc:
+                        items.append(f"  {name}: {desc[:100]}")
+                    if len(items) >= 20:
+                        break
+        header = f"[聊天记录] {title}" if title else "[聊天记录]"
+        if items:
+            return header + "\n" + "\n".join(items)
+        return header
+
     if title:
-        return f"[链接/文件] {title}"
+        des = _collapse_text(appmsg.findtext('des') or '')
+        url = (appmsg.findtext('url') or '').strip().replace('&amp;', '&')
+        parts = [f"[链接/文件] {title}"]
+        if url:
+            parts.append(f"URL: {url}")
+        if des:
+            if len(des) > 200:
+                des = des[:200] + "..."
+            parts.append(f"摘要: {des}")
+        return "\n".join(parts)
     return "[链接/文件]"
 
 
@@ -537,6 +609,28 @@ def _format_voip_message_text(content):
     return f"[通话] {status_map.get(raw_text, raw_text)}"
 
 
+def _format_video_message_text(content):
+    root = _parse_xml_root(content)
+    if root is not None:
+        video = root.find('.//videomsg')
+        if video is not None:
+            length = _parse_int(video.get('playlength'))
+            if length:
+                return f"[视频] 时长 {length}秒"
+    return "[视频]"
+
+
+def _format_voice_message_text(content):
+    root = _parse_xml_root(content)
+    if root is not None:
+        voice = root.find('.//voicemsg')
+        if voice is not None:
+            length_ms = _parse_int(voice.get('voicelength'))
+            if length_ms:
+                return f"[语音] {round(length_ms / 1000, 1)}秒"
+    return "[语音]"
+
+
 def _format_message_text(local_id, local_type, content, is_group, chat_username, chat_display_name, names):
     sender_from_content, text = _parse_message_content(content, local_type, is_group)
     base_type, _ = _split_msg_type(local_type)
@@ -551,6 +645,10 @@ def _format_message_text(local_id, local_type, content, is_group, chat_username,
         text = _format_app_message_text(
             text, local_type, is_group, chat_username, chat_display_name, names
         ) or "[链接/文件]"
+    elif base_type == 43:
+        text = _format_video_message_text(text)
+    elif base_type == 34:
+        text = _format_voice_message_text(text)
     elif base_type != 1:
         type_label = format_msg_type(local_type)
         text = f"[{type_label}] {text}" if text else f"[{type_label}]"
@@ -1172,7 +1270,13 @@ def _search_all_messages(keyword, start_ts, end_ts, start_time, end_time, limit,
 
 # ============ MCP Server ============
 
-mcp = FastMCP("wechat", instructions="查询微信消息、联系人等数据")
+mcp = FastMCP("wechat", instructions="""查询微信消息、联系人、会话等数据。
+
+图片消息: 聊天记录中图片显示为 [图片] (local_id=xxx)，使用 decode_image 工具传入聊天名和 local_id 即可解密图片，返回可直接访问的图片 URL。使用 get_chat_images 可列出某个聊天的所有图片。
+视频消息: 显示为 [视频] 时长 Xs。
+语音消息: 显示为 [语音] Xs。
+富媒体消息: 链接、文件、小程序、视频号、聊天记录转发、引用回复等均已解析为文本。
+""")
 
 # 新消息追踪
 _last_check_state = {}  # {username: last_timestamp}
@@ -1489,12 +1593,32 @@ def get_new_messages() -> str:
 
 # ============ 图片解密 ============
 
-_image_resolver = ImageResolver(WECHAT_BASE_DIR, DECODED_IMAGE_DIR, _cache)
+_server_config = {"base_url": ""}  # 启动时设置
+
+
+@mcp.custom_route("/images/{filename:path}", methods=["GET"])
+async def serve_image(request):
+    """提供解密后图片的 HTTP 下载"""
+    from starlette.responses import FileResponse, Response
+    filename = request.path_params["filename"]
+    # 防止路径穿越
+    if ".." in filename or filename.startswith("/"):
+        return Response("Forbidden", status_code=403)
+    file_path = os.path.join(DECODED_IMAGE_DIR, filename)
+    if not os.path.isfile(file_path):
+        return Response("Not Found", status_code=404)
+    return FileResponse(file_path)
+
+
+_IMAGE_AES_KEY = _cfg.get("image_aes_key")
+_IMAGE_XOR_KEY = _cfg.get("image_xor_key", 0x88)
+_image_resolver = ImageResolver(WECHAT_BASE_DIR, DECODED_IMAGE_DIR, _cache,
+                                image_aes_key=_IMAGE_AES_KEY, image_xor_key=_IMAGE_XOR_KEY)
 
 
 @mcp.tool()
-def decode_image(chat_name: str, local_id: int) -> str:
-    """解密微信聊天中的一张图片。
+def decode_image(chat_name: str, local_id: int, quality: str = "hd") -> str:
+    """解密微信聊天中的一张图片，返回可直接访问的图片 URL。
 
     先用 get_chat_history 查看消息，图片消息会显示 local_id，
     然后用此工具解密对应图片。
@@ -1502,19 +1626,25 @@ def decode_image(chat_name: str, local_id: int) -> str:
     Args:
         chat_name: 聊天对象的名字、备注名或wxid
         local_id: 图片消息的 local_id（从 get_chat_history 获取）
+        quality: 图片质量 "hd"(高清,默认) 或 "thumb"(缩略图)
     """
     username = resolve_username(chat_name)
     if not username:
         return f"找不到聊天对象: {chat_name}"
 
-    result = _image_resolver.decode_image(username, local_id)
+    result = _image_resolver.decode_image(username, local_id, quality=quality)
     if result['success']:
+        img_path = result['path']
+        filename = os.path.basename(img_path)
+        base = _server_config["base_url"]
+        image_url = f"{base}/images/{filename}" if base else f"/images/{filename}"
+        available = ", ".join(result.get('available', []))
         return (
             f"解密成功!\n"
-            f"  文件: {result['path']}\n"
             f"  格式: {result['format']}\n"
             f"  大小: {result['size']:,} bytes\n"
-            f"  MD5: {result['md5']}"
+            f"  质量: {result.get('quality', 'unknown')} (可用: {available})\n"
+            f"  图片URL: {image_url}"
         )
     else:
         error = result['error']
@@ -1566,4 +1696,58 @@ def get_chat_images(chat_name: str, limit: int = 20) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    import argparse
+    parser = argparse.ArgumentParser(description="WeChat MCP Server")
+    parser.add_argument("--transport", choices=["streamable-http", "sse", "stdio"],
+                        default="streamable-http", help="传输协议（默认 streamable-http）")
+    parser.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
+    parser.add_argument("--port", type=int, default=8000, help="监听端口（默认 8000）")
+    args = parser.parse_args()
+
+    if args.transport == "sse":
+        import uvicorn
+        from starlette.applications import Starlette
+        from starlette.routing import Route, Mount
+        from mcp.server.sse import SseServerTransport
+
+        sse = SseServerTransport("/messages/")
+
+        class _SseHandled:
+            async def __call__(self, scope, receive, send):
+                pass
+
+        async def handle_sse(request):
+            async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
+                await mcp._mcp_server.run(read_stream, write_stream, mcp._mcp_server.create_initialization_options())
+            return _SseHandled()
+
+        app = Starlette(routes=[
+            Route("/sse", endpoint=handle_sse),
+            Mount("/messages/", app=sse.handle_post_message),
+        ])
+        uvicorn.run(app, host=args.host, port=args.port)
+
+    elif args.transport == "streamable-http":
+        pub_host = args.host
+        if pub_host == "0.0.0.0":
+            import socket
+            # 优先选内网 IP (192.168.x / 10.x / 172.16-31.x)
+            pub_host = "127.0.0.1"
+            for addr in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip = addr[4][0]
+                if ip.startswith("192.168.") or ip.startswith("10."):
+                    pub_host = ip
+                    break
+        _base_url = f"http://{pub_host}:{args.port}"
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        from mcp.server.fastmcp.server import TransportSecuritySettings
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        )
+        _server_config["base_url"] = _base_url
+        print(f"Image URL base: {_base_url}/images/", flush=True)
+        mcp.run(transport="streamable-http")
+
+    else:
+        mcp.run()
